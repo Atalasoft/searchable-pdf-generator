@@ -8,6 +8,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using Atalasoft.Imaging;
 using Atalasoft.Ocr;
 using Atalasoft.PdfDoc.Generating;
@@ -25,13 +26,14 @@ namespace SearchablePdfGenerator
 
 
         private Font _currentFont;
-        private PdfFontResource _currentPdfFont;
         private bool _overrideColor;
         private Color _currentColor;
         private Color _userColor;
         private SizeF _pageSize;
 
         private readonly Dictionary<Font, string> _fontsDictionary = new Dictionary<Font, string>();
+        private readonly Dictionary<Font, bool> _unicodeRequired = new Dictionary<Font, bool>();
+        private readonly Dictionary<PdfTextLine, PointF> _dimentions = new Dictionary<PdfTextLine, PointF>();
 
         public SizeF LayerSize { get { return _pageSize; } set { _pageSize = value; } }
 
@@ -64,6 +66,37 @@ namespace SearchablePdfGenerator
                 _currentColor = _userColor = info.TextColor;
 
             LayoutRegions(page.Regions, resources, page.Resolution, new Size(page.Width, page.Height));
+            
+            CollectFonts(resources);
+            SetHorizontalScaling(_dimentions, resources);
+        }
+
+        private void CollectFonts(GlobalResources resources)
+        {
+            Font currentFont = null;
+            var prevPolicy = resources.Fonts.EmbeddingPolicyProvider;
+            // this property is for decision-making based on permissions.
+            // but we use source System.Font to decide whether to embed the font or not.
+            resources.Fonts.EmbeddingPolicyProvider = (resource, permissions) =>
+            {
+                // at the moment of execution, the resource is not associated with a name or with System.Font.
+                // so we use the currentFont value, setted below in foreach()
+                PdfFontEmbeddingAction action;
+                if (currentFont == null)
+                    action = PdfFontEmbeddingAction.Embed;
+                else
+                    action = _unicodeRequired[currentFont]
+                        ? PdfFontEmbeddingAction.Embed
+                        : PdfFontEmbeddingAction.DontEmbed;
+                return new PdfFontEmbeddingPolicy(action);
+            };
+            foreach (var font in _fontsDictionary)
+            {
+                currentFont = font.Key;
+                var pdfFont = resources.Fonts.FromFont(font.Key); //here calls EmbeddingPolicyProvider
+                resources.Fonts.Add(font.Value, pdfFont); 
+            }
+            resources.Fonts.EmbeddingPolicyProvider = prevPolicy;
         }
 
         private void LayoutRegions(IEnumerable regions, GlobalResources resources, Dpi resolution, Size ocrSize)
@@ -90,8 +123,7 @@ namespace SearchablePdfGenerator
                     LayoutRegions(tableRegion.Cells, resources, resolution, ocrSize);
             }
         }
-
-
+        
         private void HandleUniformLine(OcrLine line, GlobalResources resources, Dpi resolution, Size ocrSize,
             OcrTextRotation rotation)
         {
@@ -143,27 +175,7 @@ namespace SearchablePdfGenerator
 
             baseLine = GetWordBaseline(word, baseLine, resolution);
 
-            Point p = GetTextOrigin(word.Bounds, baseLine, ocrSize, rotation);
-            PointF pf = PdfUnitConvertor.ConvertPagePointToPdf(p, resolution, _pageSize.Width, _pageSize.Height);
-
-            var text = new PdfTextLine(_fontsDictionary[_currentFont], _currentFont.SizeInPoints, word.Text,
-                new PdfPoint(pf.X, pf.Y))
-            {
-                Rotation = (double)rotation,
-                RenderMode = RenderMode,
-                FillColor = PdfColorFactory.FromColor(_currentColor)
-            };
-
-            Shapes.Add(text);
-
-            if (EnforceWordWidths)
-            {
-                PointF pageDims = GetRotatedDimensions(word.Bounds, resolution, _pageSize.Width, _pageSize.Height,
-                    rotation);
-                double textWidth = MeasureText(word.Text);
-                if (textWidth > 0)
-                    text.HorizontalScaling = pageDims.X * 100 / textWidth;
-            }
+            CreateTextShape(word.Text, word.Bounds, baseLine, resolution, ocrSize, rotation);
         }
 
         private void HandleNonUniformWord(OcrWord word, int baseLine, GlobalResources resources, Dpi resolution, Size ocrSize, OcrTextRotation rotation)
@@ -180,29 +192,46 @@ namespace SearchablePdfGenerator
                     SetFontAndColor(gdiFont, color, resources);
                 }
 
-                Point p = GetTextOrigin(glyph.Bounds, baseLine, ocrSize, rotation);
-                PointF pf = PdfUnitConvertor.ConvertPagePointToPdf(p, resolution, _pageSize.Width, _pageSize.Height);
-
-                var text = new PdfTextLine(_fontsDictionary[_currentFont], _currentFont.SizeInPoints, word.Text,
-                    new PdfPoint(pf.X, pf.Y))
-                {
-                    Rotation = (double)rotation,
-                    RenderMode = RenderMode,
-                    FillColor = PdfColorFactory.FromColor(_currentColor)
-                };
-
-                Shapes.Add(text);
-
-                if (EnforceWordWidths)
-                {
-                    PointF pageDims = GetRotatedDimensions(glyph.Bounds, resolution, _pageSize.Width, _pageSize.Height, rotation);
-                    double textWidth = MeasureText(glyph.Text);
-                    if (textWidth > 0 && Math.Abs(textWidth - pageDims.X) > double.Epsilon)
-                        text.HorizontalScaling = pageDims.X * 100.0 / textWidth;
-                }
+                CreateTextShape(glyph.Text, glyph.Bounds, baseLine, resolution, ocrSize, rotation);
             }
         }
 
+        private void CreateTextShape(string text, Rectangle bounds, int baseLine, Dpi resolution, Size ocrSize, OcrTextRotation rotation)
+        {
+            _unicodeRequired[_currentFont] |= !IsPdfDocEncoding(text);
+            Point p = GetTextOrigin(bounds, baseLine, ocrSize, rotation);
+            PointF pf = PdfUnitConvertor.ConvertPagePointToPdf(p, resolution, _pageSize.Width, _pageSize.Height);
+
+            var textShape = new PdfTextLine(_fontsDictionary[_currentFont], _currentFont.SizeInPoints, text,
+                new PdfPoint(pf.X, pf.Y))
+            {
+                Rotation = (double) rotation,
+                RenderMode = RenderMode,
+                FillColor = PdfColorFactory.FromColor(_currentColor)
+            };
+
+            Shapes.Add(textShape);
+
+            if (EnforceWordWidths)
+            {
+                PointF pageDims = GetRotatedDimensions(bounds, resolution, _pageSize.Width, _pageSize.Height,
+                    rotation);
+                _dimentions.Add(textShape, pageDims);
+                
+            }
+        }
+
+        private void SetHorizontalScaling(Dictionary<PdfTextLine, PointF> dimentions, GlobalResources resources)
+        {
+            foreach (var shapeDim in dimentions)
+            {
+                var shape = shapeDim.Key;
+                var textWidth = MeasureText(shape.Text, resources.Fonts[shape.FontName]);
+                var dim = shapeDim.Value;
+                if (textWidth > 0 && Math.Abs(textWidth - dim.X) > double.Epsilon)
+                    shape.HorizontalScaling = dim.X * 100 / textWidth;
+            }
+        }
 
         private int GetWordBaseline(OcrWord word, int baseLine, Dpi resolution)
         {
@@ -227,9 +256,22 @@ namespace SearchablePdfGenerator
             return baseLine;
         }
 
-        private double MeasureText(string text)
+        private double MeasureText(string text, PdfFontResource font)
         {
-            return _currentPdfFont.Metrics.MeasureText(_currentFont.SizeInPoints, text).Y;
+            return font.Metrics.MeasureText(_currentFont.SizeInPoints, text).Y;
+        }
+
+        private static bool IsPdfDocEncoding(string s)
+        {
+            return s.All(IsPdfDocEncoding);
+        }
+
+        private static bool IsPdfDocEncoding(char c)
+        {
+            // the PDF spec says this is ISO Latin 1, which is ISO 8859-1, shown in a table here:
+            // http://en.wikipedia.org/wiki/ISO/IEC_8859-1
+            return (c >= 32 && c <= 126) ||
+                    (c >= 160 && c <= 255);
         }
 
         private Point GetTextOrigin(Rectangle r, int baseline, Size ocrSize, OcrTextRotation rotation)
@@ -263,24 +305,22 @@ namespace SearchablePdfGenerator
             }
             return PdfUnitConvertor.ConvertPagePointToPdf(p, resolution, pdfPageWidth, pdfPageHeight);
         }
-
-
+        
         private void SetFontAndColor(Font font, Color color, GlobalResources resources)
         {
-            bool changeColor = !_overrideColor && !(color.Equals(CurrentColor));
+            bool changeColor = !_overrideColor && !color.Equals(CurrentColor);
             bool changeFont = !font.Equals(_currentFont);
 
             if (changeFont)
             {
                 if (!_fontsDictionary.ContainsKey(font))
                 {
-                    _currentPdfFont = resources.Fonts.FromFont(font);
-                    var resName = resources.Fonts.Add(_currentPdfFont);
+                    var resName = resources.Fonts.NextName();
                     _fontsDictionary.Add(font, resName);
+                    _unicodeRequired.Add(font, false);
                 }
 
                 _currentFont = font;
-                _currentPdfFont = resources.Fonts.Get(_fontsDictionary[font]);
             }
 
             if (changeColor)
